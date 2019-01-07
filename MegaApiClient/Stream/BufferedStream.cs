@@ -8,7 +8,7 @@ namespace CG.Web.MegaApiClient
 {
   class BufferedStream : Stream
   {
-    const int BufferSize = 65536;
+    public const int BufferSize = 65536;
 
     Stream innerStream;
     byte[] streamBuffer = new byte[BufferSize];
@@ -18,6 +18,12 @@ namespace CG.Web.MegaApiClient
     public BufferedStream(Stream innerStream)
     {
       this.innerStream = innerStream;
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+      this.innerStream.Dispose();
+      base.Dispose(disposing);
     }
 
     public byte[] Buffer => streamBuffer;

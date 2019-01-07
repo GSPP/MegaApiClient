@@ -69,7 +69,7 @@
     protected long position = 0;
     protected byte[] metaMac = new byte[8];
 
-    private readonly Stream stream;
+    private readonly BufferedStream stream;
     private readonly Mode mode;
     private readonly HashSet<long> chunksPositionsCache;
     private readonly byte[] counter = new byte[8];
@@ -77,6 +77,8 @@
     private long currentCounter = 0; // Represents the next counter value to use.
     private byte[] currentChunkMac = new byte[16];
     private byte[] fileMac = new byte[16];
+    byte[] xorBuffer = new byte[BufferedStream.BufferSize];
+    byte[] inputBuffer = new byte[BufferedStream.BufferSize];
 
     protected MegaAesCtrStream(Stream stream, long streamLength, Mode mode, byte[] fileKey, byte[] iv)
     {
@@ -95,7 +97,7 @@
         throw new ArgumentException("Invalid Iv");
       }
 
-      this.stream = stream;
+      this.stream = new BufferedStream(stream);
       this.streamLength = streamLength;
       this.mode = mode;
       this.fileKey = fileKey;
@@ -163,6 +165,78 @@
       {
         return 0;
       }
+
+      int fastPathReadCount = 0;
+
+      // Fast path for bigger buffers.
+      if (true)
+      {
+        stream.FillBuffer();
+
+        var fastAvailableCount = stream.AvailableCount;
+
+        long nextChunkPosition;
+
+        var nextChunkPositionArrayIndex = Array.BinarySearch(ChunksPositions, this.position);
+
+        if (nextChunkPositionArrayIndex >= 0) nextChunkPosition = this.position;
+        else if (~nextChunkPositionArrayIndex >= ChunksPositions.Length) nextChunkPosition = this.streamLength;
+        else nextChunkPosition = ChunksPositions[~nextChunkPositionArrayIndex];
+
+        fastAvailableCount = checked((int)Math.Min(nextChunkPosition - this.position, fastAvailableCount)); //only process up to chunk boundary
+
+        if (fastAvailableCount > count) fastAvailableCount = count;
+
+        fastAvailableCount -= fastAvailableCount % 16; //round down to full chunks
+
+        if (fastAvailableCount != 0 && this.position != 0)
+        {
+          //fastAvailableCount = 16; //TODO
+
+          // We can now directly read fastAvailableCount bytes. We stay within the current chunk.
+
+          var chunkCount = fastAvailableCount / 16;
+
+          for (int i = 0; i < chunkCount; i++)
+          {
+            this.IncrementCounter();
+
+            var xorBufferOffset = i * 16;
+            Array.Copy(this.iv, 0, xorBuffer, xorBufferOffset, 8);
+            Array.Copy(this.counter, 0, xorBuffer, xorBufferOffset + 8, 8);
+
+          }
+
+          byte[] encryptedXorBuffer = Crypto.EncryptAes(xorBuffer, encryptor); //encrypt whole buffer at once
+
+          stream.Read(inputBuffer, 0, fastAvailableCount); //this read will complete from memory in its entirety
+
+          // Xor loop.
+          for (int inputPos = 0; inputPos < fastAvailableCount; inputPos++)
+          {
+            buffer[offset + inputPos] = (byte)(inputBuffer[inputPos] ^ encryptedXorBuffer[inputPos]);
+          }
+
+          // Mac loop.
+          for (int i = 0; i < chunkCount; i++)
+          {
+            for (int inputPos = 0; inputPos < 16; inputPos++)
+            {
+              this.currentChunkMac[inputPos] ^= (this.mode == Mode.Crypt) ? inputBuffer[i * 16 + inputPos] : buffer[offset + i * 16 + inputPos];
+            }
+            this.currentChunkMac = Crypto.EncryptAes(this.currentChunkMac, encryptor);
+          }
+
+          this.position += fastAvailableCount;
+          offset += fastAvailableCount;
+          count -= fastAvailableCount;
+          fastPathReadCount = fastAvailableCount;
+        }
+      }
+
+      // This code is broken but seems to work in practice:
+      // Stream reads are assumed to be complete. Likely, this works because of typical network packet sizes.
+      // Incoming reads are assumed to be in multiples of 16 bytes.
 
       for (long pos = this.position; pos < Math.Min(this.position + count, this.streamLength); pos += 16)
       {
@@ -233,7 +307,7 @@
         this.OnStreamRead();
       }
 
-      return (int)len;
+      return (int)len + fastPathReadCount;
     }
 
     public override void Flush()
